@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "approvals": [
+    {
+      "camera": "A",
+      "card": "CARD01",
+      "first": "A0012",
+      "last": "A0013",
+      "episodes": ["E01", "E02"]
+    }
+  ]
+}
