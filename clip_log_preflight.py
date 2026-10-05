@@ -18,7 +18,7 @@ import re
 import stat
 import sys
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Sequence, TextIO
 
 SCHEMA_VERSION = 1
 COLUMNS = ["episode", "camera", "card", "first", "last"]
@@ -576,12 +576,28 @@ def audit(log_path: str | os.PathLike[str], source_specs: Sequence[Sequence[str]
 
 
 class JsonArgumentParser(argparse.ArgumentParser):
+    def __init__(self, *args: Any, output: TextIO | None = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.output = sys.stdout if output is None else output
+
     def error(self, message: str) -> None:
         raise AuditFailure("invalid_arguments", message)
 
+    def print_help(self, file: TextIO | None = None) -> None:
+        output = self.output if file is None else file
+        output.write(self.format_help())
+        output.flush()
+
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = JsonArgumentParser(description=__doc__, allow_abbrev=False)
+    """Write to the caller's stdout without closing or replacing it."""
+    if sys.stdout is None:
+        return 2
+    return _main(argv, sys.stdout)
+
+
+def _main(argv: Sequence[str] | None, output: TextIO) -> int:
+    parser = JsonArgumentParser(description=__doc__, allow_abbrev=False, output=output)
     parser.add_argument("log", help="UTF-8 CSV with header episode,camera,card,first,last")
     parser.add_argument("--source", nargs=3, action="append", required=True,
                         metavar=("CAMERA", "CARD", "DIRECTORY"),
@@ -596,15 +612,37 @@ def main(argv: Sequence[str] | None = None) -> int:
     except AuditFailure as exc:
         report = {"schema_version": SCHEMA_VERSION, "status": "error", "errors": [exc.detail]}
         code = 2
+    except (OSError, UnicodeError, ValueError):
+        # --help writes during argument parsing, before a JSON report exists.
+        return 2
     # ASCII escaping handles every valid Unicode label even under a narrow
     # console encoding. Stable keys/newline and no timestamps make runs diffable.
     try:
-        sys.stdout.write(json.dumps(report, ensure_ascii=True, sort_keys=True, indent=2) + "\n")
-    except (OSError, UnicodeError):
+        output.write(json.dumps(report, ensure_ascii=True, sort_keys=True, indent=2) + "\n")
+        output.flush()
+    except (OSError, UnicodeError, ValueError):
         # If stdout itself is closed/unwritable, no JSON can be delivered there.
         return 2
     return code
 
 
+def _cli() -> int:
+    # Own only this wrapper, never stdout's descriptor. Closing it inside the
+    # error guard discards a failed buffer instead of retrying it at interpreter
+    # shutdown (which could otherwise change the exit status to 120).
+    try:
+        descriptor = sys.stdout.fileno()
+        encoding, errors = sys.stdout.encoding, sys.stdout.errors
+    except (AttributeError, OSError, ValueError):
+        # Python can start with stdout=None when its descriptor is unavailable.
+        return 2
+    try:
+        with open(descriptor, "w", encoding=encoding,
+                  errors=errors, closefd=False) as output:
+            return _main(None, output)
+    except (OSError, UnicodeError, ValueError):
+        return 2
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_cli())
