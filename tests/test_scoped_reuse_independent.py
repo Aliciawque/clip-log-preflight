@@ -21,6 +21,7 @@ sys.dont_write_bytecode = True
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
 import clip_log_preflight as app
+from filesystem_fixtures import install_symlink_fixtures
 
 
 class IndependentScopedReuseTests(unittest.TestCase):
@@ -32,6 +33,7 @@ class IndependentScopedReuseTests(unittest.TestCase):
         self.log = self.root / "log.csv"
         self.policy = self.root / "reuse.json"
         self.sources = [("CAM", "CARD", str(self.media))]
+        install_symlink_fixtures(self)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -334,8 +336,9 @@ class IndependentScopedReuseTests(unittest.TestCase):
         ids = ["A001", "a001", "A01", "001", "é001", "e\u0301001", "攝影001"]
         rows = []
         approvals = []
-        for clip_id in ids:
-            self.clip(clip_id + ".mov")
+        for index, clip_id in enumerate(ids):
+            # Preserve distinct stems on case-insensitive/normalizing filesystems.
+            self.clip(f"fixture-{index}/{clip_id}.mov")
             rows.extend([self.row("E1", clip_id), self.row("E2", clip_id)])
             approvals.append(self.approval(clip_id))
         self.rows(*rows)
