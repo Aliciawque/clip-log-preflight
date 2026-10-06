@@ -6,7 +6,8 @@ camera/card directories before you act on the log.
 Export five columns from a spreadsheet, supply one directory per camera/card
 scope, and get either an exact filename manifest for every episode or a list of
 blockers. It catches missing IDs, overlapping assignments and ambiguous
-filenames. It does **not** download, copy, rename, inspect or edit media.
+filenames. An optional, explicit reuse policy lets reviewed clips appear in an
+exact set of episodes. It does **not** download, copy, rename, inspect or edit media.
 
 Python 3.10+; standard library only; no installation, account or network needed.
 This is a standalone example, not an NLE plugin or a downloader.
@@ -91,17 +92,105 @@ workflow:
 - Camera/card labels must match a configured source exactly, including case
 - Each source scope is configured once. Duplicate scopes, overlapping root trees,
   and roots referring to the same directory are rejected
-- One scoped clip can occur only once in an audit. Overlapping rows, repeated
-  assignments to one episode, and reuse across episodes all block the audit
+- By default, one scoped clip can occur only once in an audit. Overlapping rows,
+  repeated assignments to one episode, and reuse across episodes all block
+- With an explicit reuse policy, the same scoped clip can occur once in each of
+  its approved episodes. Repeated assignments to the same episode still block
 - Two requested paths referring to the same filesystem file also block, even
   under different IDs/scopes. This catches hardlink aliases using device/inode
   metadata without reading media bytes
-- Intentional cross-episode reuse is possible in real work, but has no opt-in in
-  this version. Review that reuse yourself and run the episodes as separate CSV
-  audits if appropriate. Separate invocations do not check each other's history
 - The header must be exactly `episode,camera,card,first,last`. Duplicate/reordered
   headers, additional/missing cells and blank records are rejected. Use comma CSV
   with conventional double-quote escaping; UTF-8 with an initial BOM is accepted
+
+## Explicit cross-episode reuse
+
+Some episode logs intentionally reuse a clip, for example an establishing shot
+selected for multiple chapters. Use `--reuse-policy PATH` only after reviewing
+that editorial decision. The tool never infers B-roll, intent, or permission from
+a filename, folder, media content or matching episode labels. Without this option,
+the existing cross-episode refusal is unchanged.
+
+The policy is a UTF-8 JSON file (an initial BOM is accepted). Here is the complete
+included `examples/reuse-policy.json`:
+
+```json
+{
+  "schema_version": 1,
+  "approvals": [
+    {
+      "camera": "A",
+      "card": "CARD01",
+      "first": "A0012",
+      "last": "A0013",
+      "episodes": ["E01", "E02"]
+    }
+  ]
+}
+```
+
+This approves each of `A0012` and `A0013` in the exact `A`/`CARD01` scope for
+exactly `E01` and `E02`. Every approved ID must occur in every approved episode,
+and nowhere else in the log. An approval for three episodes cannot be used for a
+two-episode audit; review and narrow the policy for that audit. Each invocation
+checks only the supplied log, not another audit's history.
+
+Policy rules:
+
+- `schema_version` must be the integer `1`, not `true`, `1.0` or a string
+- `approvals` must be a nonempty list. Each entry has exactly the five fields
+  shown above; unsupported fields and duplicate JSON object keys are rejected
+- Camera/card labels, episode labels and range endpoints follow the CSV text
+  rules. Ranges are inclusive, preserve case and zero padding, and use only final
+  ASCII digits. All labels are literal; there are no wildcard or global approvals
+- An entry needs at least two distinct episode labels. Duplicate episode labels,
+  overlapping or duplicate approval ranges, and unknown source scopes are errors
+- Every approved ID must actually be reused in the exact approved episode set.
+  Unused IDs/approvals, missing approved episodes and extra episodes block the
+  entire audit, with expected/actual episode counts and label samples. Correct the log or remove or
+  narrow stale approvals after review; a policy is not a blanket suppression
+- A repeated assignment within the same episode always blocks, even with approval
+- An approved reuse must resolve to the same exact scoped ID and candidate path.
+  Different paths or scoped IDs pointing to the same inode still block as
+  hardlink aliases. Missing files, ambiguous stems and incomplete scans still block
+
+### Try reuse without real media
+
+This runs both refusal and approved-reuse paths using the two included example
+files and **empty filename fixtures**. It does not need media, accounts or packages.
+
+```sh
+python3 - <<'PY'
+from pathlib import Path
+import json
+import subprocess
+import sys
+import tempfile
+
+with tempfile.TemporaryDirectory(prefix="clip-reuse-demo-") as temporary:
+    source = Path(temporary)
+    for clip in ["A0012", "A0013"]:
+        (source / f"{clip}.mov").touch()
+    command = [sys.executable, "clip_log_preflight.py", "examples/reused-episode-log.csv",
+               "--source", "A", "CARD01", str(source)]
+    refused = subprocess.run(command, capture_output=True, text=True, check=False)
+    assert refused.returncode == 1, refused.stdout
+    assert "manifests" not in json.loads(refused.stdout)
+    approved = subprocess.run(command + ["--reuse-policy", "examples/reuse-policy.json"],
+                              capture_output=True, text=True, check=False)
+    assert approved.returncode == 0, approved.stdout
+    report = json.loads(approved.stdout)
+    assert report["counts"]["unique_assignments"] == 4
+    assert report["counts"]["unique_scoped_clips"] == 2
+    assert report["counts"]["requested_physical_files"] == 2
+    assert len(report["accepted_reuse"]) == 2
+    print(approved.stdout, end="")
+PY
+```
+
+Expected: `"status": "ready"`, two episode manifests, four assignments, two
+unique scoped clips, two requested physical files and two `accepted_reuse`
+entries naming `E01` and `E02`. Temporary paths disappear when the demo finishes.
 
 ## What gets scanned
 
@@ -138,7 +227,8 @@ referenced by the log are not themselves blockers.
 
 Symlinks are never intentionally followed. A symlink in a source tree blocks the
 audit even if it is broken, hidden or has an unsupported extension. A symlink in
-a source root's or log file's path, including an ancestor component, also blocks.
+a source root's, log file's or reuse policy's path, including an ancestor
+component, also blocks. Logs and policies must be bounded regular files.
 Non-regular entries such as FIFOs and sockets block a source scan. Use ordinary
 local directory trees, not link farms.
 
@@ -152,6 +242,12 @@ Hard limits keep accidental range expansions and scans bounded:
 | Limit | Maximum |
 | --- | ---: |
 | CSV bytes | 2 MiB |
+| Reuse-policy bytes | 2 MiB |
+| Policy approval entries | 10,000 |
+| Inclusive IDs per approval | 10,000 |
+| Expanded IDs across approvals | 100,000 |
+| Approved assignments, summed as IDs × episodes for each approval | 100,000 |
+| Episode-label samples per list in a policy-mismatch diagnostic | 5 |
 | Data records | 10,000 |
 | Source roots | 16 |
 | Inclusive IDs per record | 10,000 |
@@ -168,7 +264,8 @@ Except for `--help`, stdout contains one JSON document. It has `schema_version: 
 `status` and an `errors` list. Error entries contain a stable `code`, a human
 `message` and relevant context such as CSV `record`, scope or candidate paths.
 `record` counts logical CSV records, with the header as record 1; parse errors can
-also include `physical_line`.
+also include `physical_line`. Policy diagnostics use one-based `approval` entry
+numbers where applicable.
 
 Exit codes:
 
@@ -180,6 +277,13 @@ Exit codes:
 
 A per-record oversized range is a validation blocker (`1`); aggregate resource
 caps stop the audit (`2`). Missing/invalid CLI arguments are also JSON errors.
+Malformed policies, unsupported fields, invalid approval ranges, duplicate or
+overlapping approvals and unknown policy scopes are configuration errors (`2`).
+A valid policy whose episode sets do not match the log is a blocker (`1`).
+Its `approved_episodes`, `actual_episodes`, `missing_episodes` and
+`unapproved_episodes` diagnostic lists each show at most five sorted labels.
+Each has an exact `*_episode_count` and an explicit `*_episodes_truncated` flag;
+these bounded samples are not complete episode sets when that flag is true.
 If stdout itself cannot be written, delivering a JSON error there is impossible;
 the command returns `2` when it detects the failure.
 
@@ -205,6 +309,24 @@ All episodes succeed together or none receive a manifest. The `manifests` key is
 Always check the exit code before using the output. Nothing consumes the manifest
 automatically, and it is not an NLE interchange format.
 
+When a policy is supplied and the entire audit is ready, `accepted_reuse` lists
+each actually accepted reused scoped clip, sorted by camera/card/ID, with its
+sorted `episodes` list. It is absent on blocked/error reports. This is an audit
+of the explicit policy and log, not an inferred editorial classification.
+
+`counts.unique_assignments` counts distinct episode/camera/card/ID assignments;
+an approved clip in two episodes counts twice. Policy runs additionally report
+`counts.unique_scoped_clips`. Ready policy runs also report
+`counts.requested_physical_files`, counting distinct device/inode identities among
+requested files, so accepted reuse is counted once physically. In contrast,
+`counts.media_files` counts all allowed media candidate paths found by the scan,
+including unrequested files. Counts on failed audits can be partial; only a ready
+report describes a completed match. Runs without a policy retain the prior
+report shape and counts.
+
+The Python API accepts the same optional path:
+`audit(log_path, source_specs, extensions=None, reuse_policy=None)`.
+
 You can redirect stdout to a report file using your shell. That shell operation
 writes the chosen report; the CLI itself does not create output files. Reports
 include local paths, filenames and labels, and OS errors may expose paths too.
@@ -224,8 +346,8 @@ Review and redact them before sharing publicly.
 - This is not a security boundary against concurrent filesystem changes. Keep
   source trees stable during the audit and before consuming a manifest. Metadata
   checks and directory traversal are not an atomic filesystem snapshot
-- Reading the CSV or directory metadata may update access times (`atime`). The
-  audit does not intentionally modify log/media bytes, names or modification times
+- Reading CSV/policy bytes or directory metadata may update access times (`atime`).
+  The audit does not intentionally modify input/media bytes, names or modification times
 - No network APIs, downloads, copying, renaming, deletion or external services.
   Use local storage: a path backed by an OS-mounted network filesystem can still
   cause filesystem traffic outside this program's control
@@ -245,6 +367,8 @@ Tests create temporary synthetic filename fixtures (empty files and tiny
 non-media sentinel content), never real video. They cover
 range expansion, source collisions, exact matching, CSV/Unicode faults, scan
 failures and caps, links, CLI JSON/exit behavior and unchanged input/media data.
+Reuse tests also cover strict JSON/schema validation, stale/partial approvals,
+exact episode sets, alias rejection, deterministic reports and policy resource caps.
 Some OS-specific tests skip where the necessary filesystem feature is absent.
 
 The included GitHub Actions workflow uses the runner's built-in `python3`, runs

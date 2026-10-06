@@ -18,7 +18,7 @@ import re
 import stat
 import sys
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Sequence, TextIO
 
 SCHEMA_VERSION = 1
 COLUMNS = ["episode", "camera", "card", "first", "last"]
@@ -27,6 +27,11 @@ DEFAULT_EXTENSIONS = frozenset(
      ".webm", ".mpg", ".mpeg", ".r3d", ".braw", ".ari", ".crm"}
 )
 MAX_LOG_BYTES = 2 * 1024 * 1024
+MAX_POLICY_BYTES = 2 * 1024 * 1024
+MAX_APPROVALS = 10_000
+MAX_POLICY_EXPANDED = 100_000
+MAX_POLICY_ASSIGNMENTS = 100_000
+MAX_DIAGNOSTIC_EPISODES = 5
 MAX_SOURCES = 16
 MAX_ENTRIES = 100_000
 MAX_ROWS = 10_000
@@ -65,6 +70,12 @@ class Assignment:
     card: str
     clip_id: str
     record: int
+
+
+@dataclass(frozen=True)
+class ReuseApproval:
+    approval: int
+    episodes: frozenset[str]
 
 
 class Blockers:
@@ -242,11 +253,145 @@ def _read_rows(log_path: str | os.PathLike[str]) -> list[tuple[int, list[str]]]:
     return rows
 
 
+def _range_parts(first: str, last: str) -> tuple[str, int, int, int]:
+    """Apply the same exact, bounded ID-range rules to logs and policies."""
+    start_match, end_match = IDENTIFIER.fullmatch(first), IDENTIFIER.fullmatch(last)
+    if (not start_match or not end_match or any(c in first + last for c in "/\\")):
+        raise AuditFailure("invalid_range", "Each endpoint must end with an ASCII digit run "
+                           "and must not contain a path separator.")
+    prefix, digits = start_match.groups()
+    end_prefix, end_digits = end_match.groups()
+    if prefix != end_prefix or len(digits) != len(end_digits):
+        raise AuditFailure("incompatible_endpoints", "Endpoints must have identical prefixes "
+                           "and digit widths; comparison is case-sensitive.")
+    start, end = int(digits), int(end_digits)
+    if end < start:
+        raise AuditFailure("descending_range", "Range end precedes range start.")
+    if end - start + 1 > MAX_RANGE:
+        raise AuditFailure("range_limit", "Inclusive range exceeds the per-record clip limit.",
+                           limit=MAX_RANGE)
+    return prefix, len(digits), start, end
+
+
+def _policy_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise AuditFailure("reuse_policy_format", "Duplicate JSON object keys are forbidden.",
+                               key=key)
+        result[key] = value
+    return result
+
+
+def _reject_constant(value: str) -> None:
+    raise AuditFailure("reuse_policy_format", "Non-finite JSON numbers are forbidden.", value=value)
+
+
+def _read_reuse_policy(policy_path: str | os.PathLike[str], sources: list[Source]) -> dict[
+        tuple[str, str, str], ReuseApproval]:
+    path = _absolute_path(policy_path)
+    info = path.stat()
+    if not stat.S_ISREG(info.st_mode):
+        raise AuditFailure("not_regular_policy", "The reuse policy must be a regular file.", path=str(path))
+    if info.st_size > MAX_POLICY_BYTES:
+        raise AuditFailure("policy_size_limit", "Reuse policy exceeds the byte limit.", limit=MAX_POLICY_BYTES)
+    with path.open("rb") as handle:
+        data = handle.read(MAX_POLICY_BYTES + 1)
+    if len(data) > MAX_POLICY_BYTES:
+        raise AuditFailure("policy_size_limit", "Reuse policy exceeds the byte limit.", limit=MAX_POLICY_BYTES)
+    try:
+        policy = json.loads(data.decode("utf-8-sig"), object_pairs_hook=_policy_object,
+                            parse_constant=_reject_constant)
+    except (UnicodeError, ValueError, RecursionError) as exc:
+        raise AuditFailure("reuse_policy_format", "Reuse policy must be valid UTF-8 JSON "
+                           "with no excessive nesting.") from exc
+    if (not isinstance(policy, dict) or set(policy) != {"schema_version", "approvals"}
+            or type(policy["schema_version"]) is not int or policy["schema_version"] != 1
+            or not isinstance(policy["approvals"], list) or not policy["approvals"]):
+        raise AuditFailure("reuse_policy_schema", "Use exactly schema_version: 1 and a nonempty approvals list.")
+    approvals = policy["approvals"]
+    if len(approvals) > MAX_APPROVALS:
+        raise AuditFailure("policy_approval_limit", "Reuse policy exceeds the approval count limit.",
+                           limit=MAX_APPROVALS)
+    known = {(source.camera, source.card) for source in sources}
+    result: dict[tuple[str, str, str], ReuseApproval] = {}
+    expanded = 0
+    assignments = 0
+    for position, approval in enumerate(approvals, start=1):
+        if (not isinstance(approval, dict)
+                or set(approval) != {"camera", "card", "first", "last", "episodes"}):
+            raise AuditFailure("reuse_policy_schema", "Each approval needs exactly camera, card, "
+                               "first, last and episodes; remove unsupported fields.", approval=position)
+        if any(not isinstance(approval[field], str) or not _valid_text(approval[field])
+               for field in ("camera", "card", "first", "last")):
+            raise AuditFailure("reuse_policy_field", "Approval labels and endpoints must follow "
+                               "the CSV text rules.", approval=position)
+        episodes = approval["episodes"]
+        if (not isinstance(episodes, list) or len(episodes) < 2
+                or any(not isinstance(episode, str) or not _valid_text(episode) for episode in episodes)
+                or len(set(episodes)) != len(episodes)):
+            raise AuditFailure("reuse_policy_episodes", "List at least two distinct exact episode "
+                               "labels, each following the CSV text rules.", approval=position)
+        camera, card = approval["camera"], approval["card"]
+        if (camera, card) not in known:
+            raise AuditFailure("reuse_policy_unknown_source", "Configure this exact camera/card "
+                               "source or remove its approval.", approval=position, camera=camera, card=card)
+        try:
+            prefix, width, start, end = _range_parts(approval["first"], approval["last"])
+        except AuditFailure as exc:
+            raise AuditFailure("reuse_policy_range", "Correct the approval range: " + str(exc),
+                               approval=position, range_code=exc.detail["code"]) from exc
+        expanded += end - start + 1
+        assignments += (end - start + 1) * len(episodes)
+        if expanded > MAX_POLICY_EXPANDED:
+            raise AuditFailure("policy_expanded_limit", "Reuse policy exceeds the expanded-clip limit.",
+                               limit=MAX_POLICY_EXPANDED)
+        if assignments > MAX_POLICY_ASSIGNMENTS:
+            raise AuditFailure("policy_assignment_limit", "Reuse policy exceeds the approved-assignment limit.",
+                               limit=MAX_POLICY_ASSIGNMENTS)
+        entry = ReuseApproval(position, frozenset(episodes))
+        for number in range(start, end + 1):
+            clip_id = prefix + str(number).zfill(width)
+            key = (camera, card, clip_id)
+            if key in result:
+                raise AuditFailure("reuse_policy_overlap", "Approval ranges must not overlap; "
+                                   "consolidate or remove this approval.", approval=position,
+                                   previous_approval=result[key].approval, camera=camera, card=card,
+                                   clip_id=clip_id)
+            result[key] = entry
+    return result
+
+
+def _validate_reuse(assignments: list[Assignment],
+                    reuse: dict[tuple[str, str, str], ReuseApproval], blockers: Blockers) -> None:
+    actual: dict[tuple[str, str, str], set[str]] = {}
+    for assignment in assignments:
+        key = (assignment.camera, assignment.card, assignment.clip_id)
+        actual.setdefault(key, set()).add(assignment.episode)
+    for (camera, card, clip_id), approval in sorted(reuse.items()):
+        episodes = actual.get((camera, card, clip_id), set())
+        if episodes != approval.episodes:
+            context: dict[str, Any] = {}
+            for label, values in (("approved", approval.episodes), ("actual", episodes),
+                                  ("missing", approval.episodes - episodes),
+                                  ("unapproved", episodes - approval.episodes)):
+                context[label + "_episodes"] = sorted(values)[:MAX_DIAGNOSTIC_EPISODES]
+                context[label + "_episode_count"] = len(values)
+                context[label + "_episodes_truncated"] = len(values) > MAX_DIAGNOSTIC_EPISODES
+            blockers.add("reuse_episode_mismatch" if episodes else "unused_reuse_approval",
+                         "Each approved clip must appear in exactly the approved episodes. "
+                         "Review the log and correct or remove stale approvals; no reuse is accepted.",
+                         approval=approval.approval, camera=camera, card=card, clip_id=clip_id,
+                         **context)
+
+
 def _expand(rows: list[tuple[int, list[str]]], sources: list[Source],
-            blockers: Blockers) -> list[Assignment]:
+            blockers: Blockers,
+            reuse: dict[tuple[str, str, str], ReuseApproval] | None = None) -> list[Assignment]:
     known = {(source.camera, source.card) for source in sources}
     assignments: list[Assignment] = []
     seen: dict[tuple[str, str, str], Assignment] = {}
+    seen_episodes: dict[tuple[str, str, str, str], Assignment] = {}
     expanded = 0
     for record, row in rows:
         episode, camera, card, first, last = row
@@ -259,43 +404,35 @@ def _expand(rows: list[tuple[int, list[str]]], sources: list[Source],
             blockers.add("unknown_source", "No source is configured for this exact camera/card scope.",
                          record=record, camera=camera, card=card)
             continue
-        start_match, end_match = IDENTIFIER.fullmatch(first), IDENTIFIER.fullmatch(last)
-        if (not start_match or not end_match or any(c in first + last for c in "/\\")):
-            blockers.add("invalid_range", "Each endpoint must end with an ASCII digit run "
-                         "and must not contain a path separator.", record=record)
-            continue
-        prefix, digits = start_match.groups()
-        end_prefix, end_digits = end_match.groups()
-        if prefix != end_prefix or len(digits) != len(end_digits):
-            blockers.add("incompatible_endpoints", "Endpoints must have identical prefixes "
-                         "and digit widths; comparison is case-sensitive.", record=record)
-            continue
-        start, end = int(digits), int(end_digits)
-        if end < start:
-            blockers.add("descending_range", "Range end precedes range start.", record=record)
+        try:
+            prefix, width, start, end = _range_parts(first, last)
+        except AuditFailure as exc:
+            blockers.add(**exc.detail, record=record)
             continue
         count = end - start + 1
-        if count > MAX_RANGE:
-            blockers.add("range_limit", "Inclusive range exceeds the per-record clip limit.",
-                         record=record, limit=MAX_RANGE)
-            continue
         expanded += count
         if expanded > MAX_EXPANDED:
             raise AuditFailure("expanded_limit", "CSV log exceeds the total expanded-clip limit.",
                                limit=MAX_EXPANDED)
         for number in range(start, end + 1):
-            clip_id = prefix + str(number).zfill(len(digits))
+            clip_id = prefix + str(number).zfill(width)
             assignment = Assignment(episode, camera, card, clip_id, record)
             key = (camera, card, clip_id)
-            previous = seen.get(key)
+            episode_key = (*key, episode)
+            previous = seen_episodes.get(episode_key) or seen.get(key)
             if previous is not None:
-                code = "duplicate_assignment" if previous.episode == episode else "cross_episode_reuse"
-                blockers.add(code, "A scoped clip may be assigned only once per audit.",
-                             record=record, previous_record=previous.record, episode=episode,
-                             previous_episode=previous.episode, camera=camera, card=card, clip_id=clip_id)
-            else:
-                seen[key] = assignment
-                assignments.append(assignment)
+                if previous.episode == episode or reuse is None or key not in reuse:
+                    code = "duplicate_assignment" if previous.episode == episode else "cross_episode_reuse"
+                    message = "A scoped clip may be assigned only once per audit."
+                    if reuse is not None:
+                        message += " Review the log and approve only exact intentional cross-episode reuse."
+                    blockers.add(code, message,
+                                 record=record, previous_record=previous.record, episode=episode,
+                                 previous_episode=previous.episode, camera=camera, card=card, clip_id=clip_id)
+                    continue
+            seen.setdefault(key, assignment)
+            seen_episodes[episode_key] = assignment
+            assignments.append(assignment)
     return assignments
 
 
@@ -347,7 +484,8 @@ def _index(sources: list[Source], extensions: frozenset[str]) -> tuple[
 
 
 def audit(log_path: str | os.PathLike[str], source_specs: Sequence[Sequence[str]],
-          extensions: Sequence[str] | None = None) -> tuple[dict[str, Any], int]:
+          extensions: Sequence[str] | None = None,
+          reuse_policy: str | os.PathLike[str] | None = None) -> tuple[dict[str, Any], int]:
     """Return (JSON-compatible report, exit code). Never emit a partial manifest."""
     report: dict[str, Any] = {"schema_version": SCHEMA_VERSION, "status": "error", "errors": []}
     blockers = Blockers()
@@ -356,9 +494,14 @@ def audit(log_path: str | os.PathLike[str], source_specs: Sequence[Sequence[str]
         allowed = _extensions(extensions)
         report["sources"] = [source.output() for source in sources]
         report["extensions"] = sorted(allowed)
+        reuse = _read_reuse_policy(reuse_policy, sources) if reuse_policy is not None else None
         rows = _read_rows(log_path)
-        assignments = _expand(rows, sources, blockers)
+        assignments = _expand(rows, sources, blockers, reuse)
         report["counts"] = {"log_records": len(rows), "unique_assignments": len(assignments)}
+        if reuse is not None:
+            report["counts"]["unique_scoped_clips"] = len({
+                (assignment.camera, assignment.card, assignment.clip_id) for assignment in assignments})
+            _validate_reuse(assignments, reuse, blockers)
         if blockers.errors:
             report.update(status="blocked", errors=blockers.errors)
             return report, 1
@@ -385,14 +528,22 @@ def audit(log_path: str | os.PathLike[str], source_specs: Sequence[Sequence[str]
                 previous = requested_files.get(identity)
                 if previous is not None:
                     previous_assignment, previous_candidate = previous
-                    blockers.add("physical_clip_reuse", "Two requested paths identify the same "
-                                 "filesystem file (for example, hardlink aliases).", **context, **candidate,
-                                 previous_record=previous_assignment.record,
-                                 previous_episode=previous_assignment.episode,
-                                 previous_source_index=previous_candidate["source_index"],
-                                 previous_relative_path=previous_candidate["relative_path"])
-                    continue
-                requested_files[identity] = (assignment, candidate)
+                    key = (assignment.camera, assignment.card, assignment.clip_id)
+                    previous_key = (previous_assignment.camera, previous_assignment.card,
+                                    previous_assignment.clip_id)
+                    approved_repeat = (reuse is not None and key in reuse and key == previous_key
+                                       and candidate == previous_candidate
+                                       and assignment.episode != previous_assignment.episode)
+                    if not approved_repeat:
+                        blockers.add("physical_clip_reuse", "Two requested paths identify the same "
+                                     "filesystem file (for example, hardlink aliases).", **context, **candidate,
+                                     previous_record=previous_assignment.record,
+                                     previous_episode=previous_assignment.episode,
+                                     previous_source_index=previous_candidate["source_index"],
+                                     previous_relative_path=previous_candidate["relative_path"])
+                        continue
+                else:
+                    requested_files[identity] = (assignment, candidate)
                 by_episode.setdefault(assignment.episode, []).append({
                     "camera": assignment.camera, "card": assignment.card, "clip_id": assignment.clip_id,
                     "record": assignment.record, **candidate,
@@ -400,6 +551,13 @@ def audit(log_path: str | os.PathLike[str], source_specs: Sequence[Sequence[str]
         if blockers.errors:
             report.update(status="blocked", errors=blockers.errors)
             return report, 1
+        if reuse is not None:
+            report["accepted_reuse"] = [
+                {"camera": camera, "card": card, "clip_id": clip_id,
+                 "episodes": sorted(approval.episodes)}
+                for (camera, card, clip_id), approval in sorted(reuse.items())
+            ]
+            report["counts"]["requested_physical_files"] = len(requested_files)
         report["manifests"] = [
             {"episode": episode, "clips": sorted(clips, key=lambda clip: (
                 clip["camera"], clip["card"], clip["clip_id"], clip["relative_path"]))}
@@ -418,33 +576,73 @@ def audit(log_path: str | os.PathLike[str], source_specs: Sequence[Sequence[str]
 
 
 class JsonArgumentParser(argparse.ArgumentParser):
+    def __init__(self, *args: Any, output: TextIO | None = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.output = sys.stdout if output is None else output
+
     def error(self, message: str) -> None:
         raise AuditFailure("invalid_arguments", message)
 
+    def print_help(self, file: TextIO | None = None) -> None:
+        output = self.output if file is None else file
+        output.write(self.format_help())
+        output.flush()
+
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = JsonArgumentParser(description=__doc__, allow_abbrev=False)
+    """Write to the caller's stdout without closing or replacing it."""
+    if sys.stdout is None:
+        return 2
+    return _main(argv, sys.stdout)
+
+
+def _main(argv: Sequence[str] | None, output: TextIO) -> int:
+    parser = JsonArgumentParser(description=__doc__, allow_abbrev=False, output=output)
     parser.add_argument("log", help="UTF-8 CSV with header episode,camera,card,first,last")
     parser.add_argument("--source", nargs=3, action="append", required=True,
                         metavar=("CAMERA", "CARD", "DIRECTORY"),
                         help="one local directory tree for a unique, case-sensitive scope; repeat as needed")
     parser.add_argument("--extension", action="append",
                         help="allowed media extension; repeat to REPLACE the default allowlist")
+    parser.add_argument("--reuse-policy", metavar="PATH",
+                        help="optional UTF-8 JSON approvals for exact scoped IDs and episode sets")
     try:
         arguments = parser.parse_args(argv)
-        report, code = audit(arguments.log, arguments.source, arguments.extension)
+        report, code = audit(arguments.log, arguments.source, arguments.extension, arguments.reuse_policy)
     except AuditFailure as exc:
         report = {"schema_version": SCHEMA_VERSION, "status": "error", "errors": [exc.detail]}
         code = 2
+    except (OSError, UnicodeError, ValueError):
+        # --help writes during argument parsing, before a JSON report exists.
+        return 2
     # ASCII escaping handles every valid Unicode label even under a narrow
     # console encoding. Stable keys/newline and no timestamps make runs diffable.
     try:
-        sys.stdout.write(json.dumps(report, ensure_ascii=True, sort_keys=True, indent=2) + "\n")
-    except (OSError, UnicodeError):
+        output.write(json.dumps(report, ensure_ascii=True, sort_keys=True, indent=2) + "\n")
+        output.flush()
+    except (OSError, UnicodeError, ValueError):
         # If stdout itself is closed/unwritable, no JSON can be delivered there.
         return 2
     return code
 
 
+def _cli() -> int:
+    # Own only this wrapper, never stdout's descriptor. Closing it inside the
+    # error guard discards a failed buffer instead of retrying it at interpreter
+    # shutdown (which could otherwise change the exit status to 120).
+    try:
+        descriptor = sys.stdout.fileno()
+        encoding, errors = sys.stdout.encoding, sys.stdout.errors
+    except (AttributeError, OSError, ValueError):
+        # Python can start with stdout=None when its descriptor is unavailable.
+        return 2
+    try:
+        with open(descriptor, "w", encoding=encoding,
+                  errors=errors, closefd=False) as output:
+            return _main(None, output)
+    except (OSError, UnicodeError, ValueError):
+        return 2
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_cli())
