@@ -232,8 +232,21 @@ component, also blocks. Logs and policies must be bounded regular files.
 Non-regular entries such as FIFOs and sockets block a source scan. Use ordinary
 local directory trees, not link farms.
 
+Windows reparse points, including directory junctions, also block in these paths
+and anywhere inside a source tree, even when no requested clip uses the entry.
+They are rejected before input reads or traversal through the entry, with the
+`reparse_point` diagnostic. Symlinks retain the existing `symlink` diagnostic.
+All reparse tags are conservatively refused, including cloud placeholder files;
+use ordinary fully local files and directories, not provider-managed reparse entries.
+
 An unreadable directory, enumeration failure, invalid-Unicode filename, missing
 path, missing file-identity metadata or exhausted cap prevents any ready manifest.
+Requested files need nonzero integer device/inode identities from a fresh
+non-following stat, not Windows' zero-filled `DirEntry.stat()` identity fields.
+Before matching, the candidate path is checked again for links/reparse points,
+regular-file type and the same identity. A detected replacement blocks with
+`source_changed`; missing identity still blocks with `file_identity_unavailable`.
+These checks do not make the audit an atomic snapshot or eliminate all races.
 Input validation runs before source scanning; fix its blockers and rerun to
 reveal any later filesystem problems.
 
@@ -351,9 +364,13 @@ Review and redact them before sharing publicly.
 - No network APIs, downloads, copying, renaming, deletion or external services.
   Use local storage: a path backed by an OS-mounted network filesystem can still
   cause filesystem traffic outside this program's control
-- Local verification was on Linux with Python 3.12.14. The code targets Python
-  3.10+; native Windows/macOS, other Python versions, NLE integration and real
-  camera media have not been tested here
+- Prior local verification was on Linux with Python 3.12.14. The complete suite
+  also passed on Windows 11 with Python 3.13.3, with the existing POSIX-only tests
+  skipped. Native junction and hardlink fixtures run on Windows. Symlink rejection
+  uses real links where permitted, and explicit metadata simulation on Windows
+  only when link creation raises privilege error 1314; its assertions still run.
+  The code targets Python 3.10+; native macOS, other Python versions,
+  NLE integration and real camera media have not been tested here
 
 ## Development and tests
 

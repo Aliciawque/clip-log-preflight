@@ -98,26 +98,35 @@ def _valid_text(value: str) -> bool:
                         or 0xD800 <= ord(c) <= 0xDFFF for c in value))
 
 
+def _reject_reparse_point(info: os.stat_result, **context: Any) -> None:
+    # Junctions need not have symlink mode. The Windows attribute exists in
+    # Python 3.5+; stat results on other platforms do not expose it.
+    if getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+        raise AuditFailure("reparse_point", "Windows reparse points are not supported.",
+                           **context)
+
+
 def _absolute_path(value: str | os.PathLike[str]) -> Path:
     raw = os.fspath(value)
     if not isinstance(raw, str) or not raw or "\x00" in raw:
         raise AuditFailure("invalid_path", "Paths must be nonempty text without NUL.")
     if any(0xD800 <= ord(c) <= 0xDFFF for c in raw):
         raise AuditFailure("invalid_path", "Paths must be valid Unicode text.")
-    # Do not normalize '..' across an unexamined symlink. Check the lexical
+    # Do not normalize '..' across an unexamined link. Check the lexical
     # components first, then canonicalize a path proven not to contain links.
     path = Path(raw)
     if not path.is_absolute():
         path = Path.cwd() / path
     for part in [*reversed(path.parents), path]:
         try:
-            mode = part.lstat().st_mode
+            info = part.lstat()
         except OSError as exc:
             raise AuditFailure("path_io", "Cannot inspect path.",
                                path=str(part), reason=str(exc)) from exc
-        if stat.S_ISLNK(mode):
+        if stat.S_ISLNK(info.st_mode):
             raise AuditFailure("symlink", "Symlink paths are not supported.",
                                path=str(part))
+        _reject_reparse_point(info, path=str(part))
     return Path(os.path.abspath(path))
 
 
@@ -174,6 +183,28 @@ def _extensions(values: Sequence[str] | None) -> frozenset[str]:
                                "and digits, with an optional leading dot.", extension=value)
         result.add(extension)
     return frozenset(result)
+
+
+def _media_stat(path: Path, **context: Any) -> os.stat_result:
+    path = _absolute_path(path)
+    # DirEntry.stat() has zero identity fields on Windows. Never follow a
+    # replacement link, and validate the fresh metadata before using its ID.
+    info = os.stat(path, follow_symlinks=False)
+    if stat.S_ISLNK(info.st_mode):
+        raise AuditFailure("symlink", "Symlinks block the audit, including non-media links.",
+                           **context)
+    _reject_reparse_point(info, **context)
+    if not stat.S_ISREG(info.st_mode):
+        raise AuditFailure("source_changed", "A media candidate is no longer a regular file.",
+                           **context)
+    return info
+
+
+def _check_identity(identity: tuple[int, int] | None, **context: Any) -> None:
+    if (not isinstance(identity, tuple) or len(identity) != 2
+            or any(type(value) is not int or value <= 0 for value in identity)):
+        raise AuditFailure("file_identity_unavailable", "The filesystem did not provide "
+                           "a usable identity for a requested file.", **context)
 
 
 def _validate_csv_quoting(text: str) -> None:
@@ -464,6 +495,7 @@ def _index(sources: list[Source], extensions: frozenset[str]) -> tuple[
                 if stat.S_ISLNK(info.st_mode):
                     raise AuditFailure("symlink", "Symlinks block the audit, including non-media links.",
                                        source_index=source.index, relative_path=relative)
+                _reject_reparse_point(info, source_index=source.index, relative_path=relative)
                 if stat.S_ISDIR(info.st_mode):
                     pending.append(Path(entry.path))
                     continue
@@ -474,6 +506,7 @@ def _index(sources: list[Source], extensions: frozenset[str]) -> tuple[
                 if path.suffix.lower() not in extensions:
                     counts["ignored_files"] += 1
                     continue
+                info = _media_stat(Path(entry.path), source_index=source.index, relative_path=relative)
                 key = (source.camera, source.card, path.stem)
                 index.setdefault(key, []).append({"source_index": source.index, "relative_path": relative})
                 identities[(source.index, relative)] = (info.st_dev, info.st_ino)
@@ -522,9 +555,14 @@ def audit(log_path: str | os.PathLike[str], source_specs: Sequence[Sequence[str]
             else:
                 candidate = candidates[0]
                 identity = identities[(candidate["source_index"], candidate["relative_path"])]
-                if not identity[1]:
-                    raise AuditFailure("file_identity_unavailable", "The filesystem did not provide "
-                                       "a usable identity for a requested file.", **context, **candidate)
+                _check_identity(identity, **context, **candidate)
+                candidate_path = sources[candidate["source_index"]].directory / candidate["relative_path"]
+                current = _media_stat(candidate_path, **context, **candidate)
+                current_identity = (current.st_dev, current.st_ino)
+                _check_identity(current_identity, **context, **candidate)
+                if current_identity != identity:
+                    raise AuditFailure("source_changed", "A requested file changed after source scanning.",
+                                       **context, **candidate)
                 previous = requested_files.get(identity)
                 if previous is not None:
                     previous_assignment, previous_candidate = previous
