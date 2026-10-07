@@ -32,6 +32,7 @@ MAX_APPROVALS = 10_000
 MAX_POLICY_EXPANDED = 100_000
 MAX_POLICY_ASSIGNMENTS = 100_000
 MAX_DIAGNOSTIC_EPISODES = 5
+MAX_DIAGNOSTIC_CANDIDATES = 5
 MAX_SOURCES = 16
 MAX_ENTRIES = 100_000
 MAX_ROWS = 10_000
@@ -518,7 +519,9 @@ def audit(log_path: str | os.PathLike[str], source_specs: Sequence[Sequence[str]
                              **context)
             elif len(candidates) != 1:
                 blockers.add("ambiguous_clip", "Multiple media files have this exact stem in its source scope.",
-                             **context, candidates=candidates)
+                             **context, candidates=candidates[:MAX_DIAGNOSTIC_CANDIDATES],
+                             candidate_count=len(candidates),
+                             candidates_truncated=len(candidates) > MAX_DIAGNOSTIC_CANDIDATES)
             else:
                 candidate = candidates[0]
                 identity = identities[(candidate["source_index"], candidate["relative_path"])]
