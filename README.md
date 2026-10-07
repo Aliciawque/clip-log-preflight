@@ -217,7 +217,8 @@ guessed. A logged ID must resolve to exactly one file in its camera/card scope:
 
 - Zero matching files: `missing_clip`
 - Two or more matching paths, even in separate subfolders or with different
-  extensions: `ambiguous_clip`; all candidates are listed
+  extensions: `ambiguous_clip`; up to five sorted candidate paths are listed, with the
+  exact `candidate_count` and a `candidates_truncated` flag
 - Exactly one: eligible for a manifest, if the entire audit passes
 
 Unlogged files are not assigned to episodes. Duplicate stems that are never
@@ -253,6 +254,7 @@ Hard limits keep accidental range expansions and scans bounded:
 | Inclusive IDs per record | 10,000 |
 | Expanded IDs across records, including duplicates | 100,000 |
 | Scanned entries across all source trees, including directories/unsupported files | 100,000 |
+| Candidate paths per ambiguous-clip diagnostic | 5 |
 | Reported blockers before stopping | 100 |
 
 The diagnostic cap adds one final `diagnostic_limit` error. Split a genuinely
@@ -284,6 +286,14 @@ Its `approved_episodes`, `actual_episodes`, `missing_episodes` and
 `unapproved_episodes` diagnostic lists each show at most five sorted labels.
 Each has an exact `*_episode_count` and an explicit `*_episodes_truncated` flag;
 these bounded samples are not complete episode sets when that flag is true.
+Ambiguous-clip diagnostics include at most five candidates in source-index/path
+order, the exact `candidate_count`, and `candidates_truncated`. A truncated list
+is a sample, not a complete list of alternatives. The audit still scans the full
+source within the existing caps and always blocks ambiguous matches; sampling
+does not select a file or make an incomplete scan successful. This bounds repeated
+path-list amplification when the same ambiguous clip is explicitly reused across
+episodes; it is not a total JSON byte limit.
+
 If stdout itself cannot be written, delivering a JSON error there is impossible;
 the command returns `2` when it detects the failure.
 
@@ -321,8 +331,8 @@ an approved clip in two episodes counts twice. Policy runs additionally report
 requested files, so accepted reuse is counted once physically. In contrast,
 `counts.media_files` counts all allowed media candidate paths found by the scan,
 including unrequested files. Counts on failed audits can be partial; only a ready
-report describes a completed match. Runs without a policy retain the prior
-report shape and counts.
+report describes a completed match. Runs without a policy omit reuse-specific fields and retain the existing counts.
+Ambiguous-clip errors in both modes use the bounded diagnostic shape above.
 
 The Python API accepts the same optional path:
 `audit(log_path, source_specs, extensions=None, reuse_policy=None)`.
