@@ -13,6 +13,7 @@ import unittest
 from unittest.mock import patch
 
 import clip_log_preflight as preflight
+from filesystem_fixtures import install_symlink_fixtures
 
 
 class AuditTests(unittest.TestCase):
@@ -24,6 +25,7 @@ class AuditTests(unittest.TestCase):
         self.media.mkdir()
         self.log = self.root / "log.csv"
         self.specs = [("A", "C1", str(self.media))]
+        install_symlink_fixtures(self)
 
     def log_rows(self, rows):
         with self.log.open("w", encoding="utf-8", newline="") as handle:
@@ -249,11 +251,16 @@ class AuditTests(unittest.TestCase):
         self.assert_code(*self.run_audit(), 2, "csv_format")
 
     def test_escaped_quotes_and_commas_are_valid_csv(self):
-        self.log_rows([['E,"1"', "A", "C1", 'TAKE"001', 'TAKE"001']])
-        self.files('TAKE"001.mov')
+        self.specs = [('A"camera', 'C,1', str(self.media))]
+        self.log_rows([['E,"1"', 'A"camera', 'C,1', "TAKE001", "TAKE001"]])
+        self.files("TAKE001.mov")
         report, code = self.run_audit()
         self.assertEqual(code, 0, report)
         self.assertEqual(report["manifests"][0]["episode"], 'E,"1"')
+
+    def test_quoted_endpoint_is_parsed_without_requiring_an_illegal_windows_filename(self):
+        self.log_rows([["E1", "A", "C1", 'TAKE"001', 'TAKE"001']])
+        self.assert_code(*self.run_audit(), 1, "missing_clip")
 
     def test_malformed_quote_position_and_trailing_characters(self):
         for row in ('E"bad,A,C1,A001,A001', '"E1"x,A,C1,A001,A001',

@@ -22,6 +22,7 @@ sys.dont_write_bytecode = True
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
 import clip_log_preflight as app
+from filesystem_fixtures import install_symlink_fixtures
 
 
 class IndependentPreflightTests(unittest.TestCase):
@@ -32,6 +33,7 @@ class IndependentPreflightTests(unittest.TestCase):
         self.media.mkdir()
         self.log = self.root / "log.csv"
         self.source = [("CAM", "CARD", str(self.media))]
+        install_symlink_fixtures(self)
 
     def tearDown(self):
         self.temp.cleanup()
